@@ -107,8 +107,8 @@ If you use TAGAN in your research, please cite:
 ```
 @article{tagan2025,
   title={Temporal Asymmetric Geometric Attention Networks for Dynamic Graph Analysis},
-  author={TAGAN Team},
-  journal={Journal of Machine Learning Research},
+  author={Matthew Haskins},
+  journal={University of Western Australia},
   year={2025}
 }
 ```
