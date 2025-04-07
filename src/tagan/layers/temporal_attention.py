@@ -506,32 +506,86 @@ class TemporalAttention(nn.Module):
         
         # Apply attention mask if provided
         if attention_mask is not None:
-            # Handle case when attention_mask is a list
+            print(f"==== TAGAN Debug: Processing attention mask ====")
+            print(f"Attention scores: shape={attention_scores.shape}, device={x.device}")
+            print(f"Mask type: {type(attention_mask)}")
+            
+            # Convert list of masks to tensor if needed
             if isinstance(attention_mask, list):
-                # Convert list of masks to a tensor if possible
                 try:
                     attention_mask = torch.stack(attention_mask, dim=0)
-                except:
-                    # If we can't stack (e.g., different shapes), create a default mask
-                    attention_mask = torch.ones(batch_size, seq_len, seq_len, device=x.device)
+                except Exception as e:
+                    print(f"WARNING: Could not stack attention masks: {e}")
+                    attention_mask = torch.ones(seq_len, seq_len, device=x.device)
             
-            # Debug dimensions before applying mask
-            att_shape = attention_scores.shape
-            mask_shape = attention_mask.shape
+            print(f"Attention scores shape: {attention_scores.shape}, Mask shape: {attention_mask.shape}")
             
-            # Create a mask of the correct dimensions
-            if mask_shape[-1] != att_shape[-1] or mask_shape[-2] != att_shape[-2]:
-                # Need to resize the mask to match attention scores dimensions
-                print(f"Warning: Resizing mask from {mask_shape} to match attention dimensions {att_shape}")
-                # Create a new mask of the correct size
-                expanded_mask = torch.ones(batch_size, 1, att_shape[-2], att_shape[-1], device=x.device)
-            else:
-                # Expand attention mask for multi-head attention
-                # [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len]
-                expanded_mask = attention_mask.unsqueeze(1)
+            # Process the mask to match attention scores dimensions
+            try:
+                # Check mask format - we need to handle different possible formats:
+                # 1. Node existence mask: [seq_len, num_nodes] - 1 where nodes exist at each timestep
+                # 2. Connectivity mask: [num_nodes, num_nodes] - 1 where nodes can attend to each other
+                # 3. Temporal mask: [seq_len, seq_len] - 1 where timesteps can attend to each other
+                
+                # First, let's detect the format based on dimensions
+                mask_shape = attention_mask.shape
+                att_shape = attention_scores.shape  # [batch_size, num_heads, seq_len, seq_len]
+                
+                # Initialize expanded mask with the right dimensions
+                expanded_mask = torch.ones(batch_size, 1, att_shape[2], att_shape[3], device=x.device)
+                
+                if len(mask_shape) == 2:
+                    print(f"WARNING: Resizing mask from {mask_shape} to match attention dimensions {att_shape}")
+                    
+                    # Check if mask has compatible dimensions
+                    if mask_shape[0] == att_shape[2] and mask_shape[1] == att_shape[3]:
+                        # Direct compatible mask, just expand dimensions
+                        expanded_mask = attention_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1)
+                    elif mask_shape[0] == seq_len:
+                        # For temporal attention, create a mask where each timestep can attend to itself and previous timesteps
+                        # This better handles asymmetric temporal data
+                        
+                        # Apply causal attention masking if specified
+                        if getattr(self, 'causal', False):
+                            # Create a causal mask (lower triangular)
+                            causal_matrix = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+                            expanded_mask = expanded_mask * causal_matrix.unsqueeze(0).unsqueeze(0)
+                        
+                        print(f"Created permissive temporal attention mask")
+                    else:
+                        # We have a mask with incompatible dimensions - create a permissive mask instead
+                        print(f"WARNING: Mask dimensions incompatible, using permissive mask")
+                        # No changes needed to expanded_mask as it's already initialized as all ones
+                else:
+                    # For any other format, create a proper mask based on shape
+                    print(f"WARNING: Unknown mask format with shape {mask_shape}")
+                    if len(mask_shape) == 3 and mask_shape[0] == batch_size and mask_shape[1] == mask_shape[2]:
+                        # Likely [batch_size, seq_len, seq_len]
+                        expanded_mask = attention_mask.unsqueeze(1)  # [batch_size, 1, seq_len, seq_len]
+                    else:
+                        # Fallback to allowing all attention
+                        expanded_mask = torch.ones(batch_size, 1, att_shape[2], att_shape[3], device=x.device)
+                
+                # Expand to all heads if needed
+                if expanded_mask.shape[1] == 1 and self.num_heads > 1:
+                    expanded_mask = expanded_mask.expand(-1, self.num_heads, -1, -1)
+                
+                # Debug the expanded mask
+                print(f"Created expanded mask: shape={expanded_mask.shape}, all ones={torch.all(expanded_mask == 1.0).item()}")
+                print(f"Expanded mask min value: {expanded_mask.min().item()}, max value: {expanded_mask.max().item()}")
+                print(f"Zeros in expanded mask: {(expanded_mask == 0).sum().item()}")
+                
+                # Apply mask (set masked positions to negative infinity)
+                attention_scores = attention_scores.masked_fill(expanded_mask == 0, float('-inf'))
+                print(f"Successfully applied mask to attention scores")
+            except Exception as e:
+                print(f"ERROR processing attention mask: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback to using scores without masking
+                print(f"Using attention scores without masking")
             
-            # Apply mask (set masked positions to negative infinity)
-            attention_scores = attention_scores.masked_fill(expanded_mask == 0, float('-inf'))
+            print(f"==== TAGAN Debug: Finished processing attention mask ====")
         
         # Apply softmax to get attention weights
         # [batch_size, num_heads, seq_len, seq_len]
@@ -879,13 +933,16 @@ class AsymmetricTemporalAttention(TemporalAttention):
             
             # First find the maximum number of nodes across all tensors
             max_nodes = 0
+            seq_len = len(x)
             for tensor in x:
                 # Check if the tensor is itself a list (from temporal propagation)
                 if isinstance(tensor, list) and len(tensor) > 0:
                     current_tensor = tensor[0]
                 else:
                     current_tensor = tensor
-                max_nodes = max(max_nodes, current_tensor.shape[0])
+                
+                if isinstance(current_tensor, torch.Tensor):
+                    max_nodes = max(max_nodes, current_tensor.shape[0])
             
             # Now pad each tensor to the maximum size
             for tensor in x:
@@ -919,7 +976,6 @@ class AsymmetricTemporalAttention(TemporalAttention):
                 raise RuntimeError(f"Failed to stack temporal tensors with shapes {shapes}: {str(e)}")
         
         # Now x should have shape [batch_size, seq_len, features]
-        batch_size, seq_len, _ = x.size()
         batch_size, seq_len, _ = x.size()
         
         # Store original for residual connection
@@ -1061,13 +1117,36 @@ class AsymmetricTemporalAttention(TemporalAttention):
             # Create a mask of the correct dimensions
             if mask_shape[-1] != att_shape[-1] or mask_shape[-2] != att_shape[-2]:
                 print(f"WARNING: Resizing mask from {mask_shape} to match attention dimensions {att_shape}")
-                # Create a new mask of the correct size that allows full attention
-                expanded_mask = torch.ones(batch_size, 1, att_shape[-2], att_shape[-1], device=x.device)
-                print(f"Created expanded mask: shape={expanded_mask.shape}, all ones={expanded_mask.min().item() == 1.0}")
+                
+                # Instead of a permissive mask, create an appropriate mask by resizing/adapting
+                # Determine the correct shape based on attention dimensions
+                if att_shape[-1] == att_shape[-2]:  # Square matrix (often the case for attention)
+                    seq_len = att_shape[-1]
+                    # Create a meaningful temporal mask that enforces causality
+                    # Each position can attend to itself and previous positions
+                    new_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+                    
+                    # Expand for batch and heads
+                    expanded_mask = new_mask.unsqueeze(0).unsqueeze(0)
+                    expanded_mask = expanded_mask.expand(batch_size, self.num_heads, seq_len, seq_len)
+                    print(f"Created causal mask with shape {expanded_mask.shape}")
+                else:
+                    # Fallback to more conservative mask if dimensions aren't square
+                    expanded_mask = torch.ones(batch_size, self.num_heads, att_shape[-2], att_shape[-1], device=x.device)
+                    print(f"Created conservative mask of shape {expanded_mask.shape}")
+                
+                print(f"Created expanded mask: shape={expanded_mask.shape}, all ones={torch.all(expanded_mask == 1.0).item()}")
             else:
                 # Expand attention mask for multi-head attention
                 # [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len]
                 expanded_mask = attention_mask.unsqueeze(1)
+                # If the expanded_mask is all ones, we should explicitly make it causal to enforce temporal constraints
+                if torch.all(expanded_mask == 1.0):
+                    seq_len = expanded_mask.size(-1)
+                    causal_component = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+                    expanded_mask = expanded_mask * causal_component
+                    print(f"Applied causal constraints to permissive mask")
+                
                 print(f"Expanded original mask: shape={expanded_mask.shape}")
                 if torch.isnan(expanded_mask).any():
                     print("WARNING: NaN values detected in expanded mask")

@@ -22,6 +22,7 @@ The TAGAN architecture consists of several key components:
 4. **Temporal Attention**: Aggregates information across time steps
 5. **Classification/Regression Layer**: Produces final predictions
 
+![alt text](visualizations/3D-Temporal-Aggregation-Visualisation-of-TAGAN.png)
 ## Installation
 
 ### Requirements

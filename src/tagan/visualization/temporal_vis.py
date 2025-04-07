@@ -447,6 +447,107 @@ def animate_feature_timeseries(
     
     # Get sequence dimensions
     num_sequences = len(node_sequences_np)
+def plot_temporal_graph_attention(
+    attention_weights: torch.Tensor,
+    node_ids: Optional[List[List[int]]] = None,
+    timesteps: Optional[List[int]] = None,
+    title: str = "Temporal Graph Attention",
+    cmap: str = "viridis",
+    save_path: Optional[str] = None,
+    show_fig: bool = False
+) -> plt.Figure:
+    """
+    Plot attention weights between nodes across different timesteps.
+    
+    Args:
+        attention_weights: Tensor of attention weights
+                          [batch_size, num_heads, seq_len, seq_len]
+        node_ids: List of lists containing node IDs at each timestep
+        timesteps: List of timestep labels
+        title: Title for the plot
+        cmap: Colormap to use
+        save_path: Path to save the figure
+        show_fig: Whether to show the figure
+        
+    Returns:
+        Matplotlib Figure object
+    """
+    print(f"Temporal attention shape: {attention_weights.shape}")
+    
+    # Handle potential errors
+    if attention_weights is None or attention_weights.numel() == 0:
+        print("Warning: Empty attention weights provided")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.text(0.5, 0.5, "No attention data available",
+                ha='center', va='center', fontsize=14)
+        if save_path:
+            plt.savefig(save_path)
+        if show_fig:
+            plt.show()
+        return fig
+    
+    # Extract dimensions
+    batch_size, num_heads, seq_len, seq_len_inner = attention_weights.shape
+    
+    # Get a single example from the batch for visualization
+    # Average across heads if multiple heads
+    if num_heads > 1:
+        attention = attention_weights[0].mean(dim=0).detach().cpu().numpy()
+    else:
+        attention = attention_weights[0, 0].detach().cpu().numpy()
+    
+    # Create timestep labels if not provided
+    if timesteps is None:
+        timesteps = [f"t{i}" for i in range(seq_len)]
+    else:
+        # Ensure we have the right number of timesteps
+        timesteps = timesteps[:seq_len]
+        while len(timesteps) < seq_len:
+            timesteps.append(f"t{len(timesteps)}")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Plot attention heatmap
+    im = ax.imshow(attention, cmap=cmap, aspect='auto')
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Attention Weight')
+    
+    # Add labels
+    ax.set_xticks(np.arange(seq_len))
+    ax.set_yticks(np.arange(seq_len))
+    ax.set_xticklabels(timesteps)
+    ax.set_yticklabels(timesteps)
+    
+    # Label axes
+    ax.set_xlabel('To Timestep')
+    ax.set_ylabel('From Timestep')
+    
+    # Add title
+    ax.set_title(title)
+    
+    # Rotate x labels if needed
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    
+    # Add annotation of values
+    for i in range(seq_len):
+        for j in range(seq_len):
+            text = ax.text(j, i, f"{attention[i, j]:.2f}",
+                          ha="center", va="center", color="w" if attention[i, j] > 0.5 else "black")
+    
+    plt.tight_layout()
+    
+    # Save figure if path is provided
+    if save_path:
+        plt.savefig(save_path)
+    
+    # Show figure if requested
+    if show_fig:
+        plt.show()
+    
+    return fig
     seq_len = node_sequences_np[0].shape[0]
     num_nodes = node_sequences_np[0].shape[1]
     num_features = node_sequences_np[0].shape[2] if node_sequences_np[0].ndim > 2 else 1

@@ -131,10 +131,11 @@ class TemporalPredictionHead(nn.Module):
                     # Check if this is the final linear layer
                     is_final_layer = (i == linear_layers.index(linear_layers[-1]))
                     
-                    # Initialize final layer bias more negative for binary classification
-                    # to prevent all-positive prediction bias
+                    # Initialize bias for classification layers
                     if is_final_layer and self.task_type == 'classification' and self.output_dim == 1:
-                        nn.init.constant_(m.bias, -0.7)  # Balanced negative bias for optimal prediction threshold
+                        # For binary classification, initialize with a positive bias
+                        # to counter the observed negative bias in the output predictions
+                        nn.init.constant_(m.bias, 0.5)  # Positive bias to counter the 0 F1 score issue
                     else:
                         nn.init.zeros_(m.bias)
     

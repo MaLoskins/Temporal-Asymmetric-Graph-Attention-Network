@@ -20,7 +20,7 @@ import os
 def calculate_metrics(
     labels: torch.Tensor,
     predictions: torch.Tensor,
-    threshold: float = 0.7  # Increased threshold to counter positive bias
+    threshold: float = 0.5  # Standard threshold for binary classification
 ) -> Dict[str, float]:
     """
     Calculate classification metrics.
@@ -28,8 +28,8 @@ def calculate_metrics(
     Args:
         labels: Ground truth labels
         predictions: Model predictions (logits or probabilities)
-        threshold: Threshold for converting probabilities to class labels (default: 0.7)
-                  Higher threshold counteracts the positive prediction bias
+        threshold: Threshold for converting probabilities to class labels (default: 0.5)
+                  Using standard threshold based on testing results
         
     Returns:
         Dictionary of metric names and values

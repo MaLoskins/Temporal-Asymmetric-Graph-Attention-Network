@@ -117,7 +117,7 @@ def test_multi_scale_attention():
     
     # Create time stamps
     time_stamps = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(0).repeat(batch_size, 1)
-    
+     
     # Create attention module
     attention = MultiTimeScaleAttention(
         hidden_dim=hidden_dim,

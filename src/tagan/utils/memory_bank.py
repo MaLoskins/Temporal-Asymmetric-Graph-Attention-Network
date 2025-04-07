@@ -47,17 +47,27 @@ class NodeMemoryBank:
         self.decay_factor = decay_factor
         self.max_inactivity = max_inactivity
         self.device = device if device is not None else torch.device('cpu')
-        
         # Dictionary mapping node IDs to hidden states
         self.node_states = {}
         
         # Dictionary mapping node IDs to inactivity counters
         self.inactivity_counter = {}
+        
+        # Dictionary mapping node IDs to last seen timestep
+        self.last_seen = {}
+        
+        # Dictionary mapping node IDs to frequency count
+        self.frequency = {}
+        
+        # Track memory bank size for debugging
+        self.size = 0
     
     def update(
         self,
         node_ids: List[int],
-        states: torch.Tensor
+        states: torch.Tensor,
+        timestep: int = 0,
+        verbose: bool = False
     ):
         """
         Update node states in the memory bank.
@@ -65,9 +75,15 @@ class NodeMemoryBank:
         Args:
             node_ids: List of node IDs
             states: Tensor of node states [num_nodes, hidden_dim]
+            timestep: Current timestep (default: 0)
+            verbose: Whether to print debug info (default: False)
         """
         # Ensure states tensor is on the correct device
         states = states.to(self.device)
+        
+        if verbose:
+            print(f"Memory bank update: Timestep {timestep}, processing {len(node_ids)} nodes")
+            print(f"Current memory bank size: {len(self.node_states)} nodes")
         
         # Increment inactivity counter for all nodes
         for node_id in self.inactivity_counter:
@@ -75,20 +91,86 @@ class NodeMemoryBank:
         
         # Update states and reset inactivity counter for active nodes
         for i, node_id in enumerate(node_ids):
-            self.node_states[node_id] = states[i].clone()
-            self.inactivity_counter[node_id] = 0
+            # Check if index is within bounds
+            if i < states.size(0):
+                # Track frequency of node appearances
+                self.frequency[node_id] = self.frequency.get(node_id, 0) + 1
+                
+                # Check if this is a reappearing node
+                is_reappearing = False
+                if node_id in self.node_states and node_id in self.last_seen:
+                    if self.last_seen[node_id] < timestep - 1:
+                        is_reappearing = True
+                
+                # Get current state
+                current_state = states[i].clone()
+                
+                # Check for NaN values
+                if torch.isnan(current_state).any():
+                    print(f"WARNING: NaN values detected in state for node {node_id}")
+                    if node_id in self.node_states:
+                        # Use existing state to recover
+                        current_state = self.node_states[node_id].clone()
+                        print(f"Recovered from NaN using existing state")
+                    else:
+                        # Initialize with small random values to recover
+                        current_state = torch.rand_like(current_state) * 0.01
+                        print(f"Initialized with small random values to recover from NaN")
+                
+                # For reappearing nodes, blend with previous state for temporal continuity
+                if is_reappearing and node_id in self.node_states:
+                    prev_state = self.node_states[node_id]
+                    # Calculate time since last seen
+                    time_diff = timestep - self.last_seen[node_id]
+                    # Use exponential decay based on time difference
+                    memory_weight = max(0.4, self.decay_factor ** min(time_diff, 3))
+                    # Blend previous state with current state
+                    blended_state = memory_weight * prev_state + (1 - memory_weight) * current_state
+                    self.node_states[node_id] = blended_state
+                    
+                    if verbose and node_id % 50 == 0:  # Reduce logging frequency
+                        print(f"Blended state for reappearing node {node_id} with memory weight {memory_weight:.2f}")
+                else:
+                    # New node or continuously active node
+                    self.node_states[node_id] = current_state
+                
+                # Reset inactivity counter
+                self.inactivity_counter[node_id] = 0
+                
+                # Update last seen timestep
+                self.last_seen[node_id] = timestep
+                
+                if verbose and is_reappearing:
+                    print(f"Node {node_id} reappeared after {timestep - self.last_seen.get(node_id, 0)} steps")
+            elif verbose:
+                print(f"Warning: Index {i} out of bounds for states tensor of size {states.size(0)}")
         
         # Apply decay to inactive nodes
         for node_id in self.node_states:
             if node_id not in node_ids:
-                self.node_states[node_id] = self.node_states[node_id] * self.decay_factor
+                # Apply exponential decay based on inactivity duration
+                decay = self.decay_factor ** self.inactivity_counter.get(node_id, 1)
+                self.node_states[node_id] = self.node_states[node_id] * decay
         
         # Prune nodes that have been inactive for too long
+        pruned_count = 0
         for node_id in list(self.inactivity_counter.keys()):
             if self.inactivity_counter[node_id] > self.max_inactivity:
                 # Remove from memory
-                del self.node_states[node_id]
+                if node_id in self.node_states:
+                    del self.node_states[node_id]
                 del self.inactivity_counter[node_id]
+                if node_id in self.last_seen:
+                    del self.last_seen[node_id]
+                # Keep frequency for stats
+                pruned_count += 1
+        
+        # Update size
+        self.size = len(self.node_states)
+        
+        if verbose and pruned_count > 0:
+            print(f"Pruned {pruned_count} inactive nodes")
+            print(f"Updated memory bank size: {self.size} nodes")
     
     def get_state(self, node_id: int) -> Optional[torch.Tensor]:
         """
@@ -146,6 +228,20 @@ class NodeMemoryBank:
         """Reset the memory bank, clearing all states."""
         self.node_states = {}
         self.inactivity_counter = {}
+        self.last_seen = {}
+        self.frequency = {}
+        self.size = 0
+        
+    def update_state(self, node_id: int, state: torch.Tensor, timestep: int = 0):
+        """Alias for updating a single node's state (used by TemporalPropagation).
+        
+        Args:
+            node_id: Node ID to update
+            state: New state for the node
+            timestep: Current timestep (default: 0)
+        """
+        # Create a singleton list and tensor for compatibility with update method
+        self.update([node_id], state.unsqueeze(0), timestep)
     
     def save(self, filepath: str):
         """

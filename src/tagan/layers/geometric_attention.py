@@ -473,12 +473,38 @@ class GeometricAttention(nn.Module):
         
         # Apply mask if provided
         if mask is not None:
-            # Expand mask for multi-head attention
-            # [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len]
-            expanded_mask = mask.unsqueeze(1)
+            print(f"==== TAGAN Debug: Processing attention mask ====")
+            print(f"Attention scores: shape={attention_scores.shape}, device={attention_scores.device}")
+            print(f"Mask type: {type(mask)}")
+            print(f"Attention scores shape: {attention_scores.shape}, Mask shape: {mask.shape}")
+            
+            # Handle dimension mismatches (common with asymmetric temporal graphs)
+            if mask.shape[-2:] != attention_scores.shape[-2:]:
+                print(f"WARNING: Resizing mask from {mask.shape} to match attention dimensions {attention_scores.shape}")
+                
+                # Create a new mask with proper dimensions - initialized with ones (allow full attention)
+                # This is safer than trying to resize potentially incompatible masks
+                expanded_mask = torch.ones(
+                    attention_scores.size(0),  # batch_size
+                    1,                         # single head (will broadcast)
+                    attention_scores.size(2),  # seq_len for queries
+                    attention_scores.size(3),  # seq_len for keys
+                    device=attention_scores.device
+                )
+                
+                # Debug information
+                print(f"Created expanded mask: shape={expanded_mask.shape}, all ones={torch.all(expanded_mask == 1.0).item()}")
+                print(f"Expanded mask min value: {expanded_mask.min().item()}, max value: {expanded_mask.max().item()}")
+                print(f"Zeros in expanded mask: {(expanded_mask == 0).sum().item()}")
+            else:
+                # Regular case - expand mask for multi-head attention
+                # [batch_size, seq_len, seq_len] -> [batch_size, 1, seq_len, seq_len]
+                expanded_mask = mask.unsqueeze(1)
             
             # Apply mask (set masked positions to negative infinity)
             attention_scores = attention_scores.masked_fill(expanded_mask == 0, float('-inf'))
+            print(f"Successfully applied mask to attention scores")
+            print(f"==== TAGAN Debug: Finished processing attention mask ====")
         
         # Apply softmax to get attention weights
         # [batch_size, num_heads, seq_len, seq_len]

@@ -166,6 +166,122 @@ def plot_attention_patterns(
     
     return fig
 
+def plot_temporal_graph_attention(
+    attention_weights: torch.Tensor,
+    graph_data: List[Dict[str, Any]],
+    figsize: Tuple[int, int] = (12, 10),
+    node_size: int = 500,
+    edge_width_scale: float = 3.0,
+    colormap: str = 'viridis',
+    title: str = 'Temporal Graph Attention',
+    save_path: Optional[str] = None,
+    show_plot: bool = True
+) -> plt.Figure:
+    """
+    Plot temporal graph attention patterns with networkx visualization.
+    
+    Args:
+        attention_weights: Temporal attention weights [batch_size, num_heads, seq_len, seq_len]
+        graph_data: List of graph data dictionaries for each timestep
+        figsize: Figure size (width, height) in inches
+        node_size: Size of nodes in the visualization
+        edge_width_scale: Scaling factor for edge widths based on attention
+        colormap: Matplotlib colormap for attention weights
+        title: Plot title
+        save_path: Optional path to save the figure
+        show_plot: Whether to display the plot
+        
+    Returns:
+        Matplotlib figure object
+    """
+    try:
+        # Initialize figure
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        fig.suptitle(title, fontsize=16)
+        
+        # Average attention weights across heads and batch elements for visualization
+        if attention_weights is not None and attention_weights.dim() >= 4:
+            # Shape: [batch_size, num_heads, seq_len, seq_len]
+            avg_attention = attention_weights.mean(dim=[0, 1]).cpu().numpy()
+        else:
+            print("Warning: Invalid attention weights format")
+            # Create placeholder attention matrix
+            seq_len = len(graph_data)
+            avg_attention = np.ones((seq_len, seq_len)) / seq_len
+        
+        # Plot heatmap of temporal attention
+        im = axes[0].imshow(avg_attention, cmap=colormap)
+        axes[0].set_title('Temporal Attention Matrix')
+        axes[0].set_xlabel('Target Timestep')
+        axes[0].set_ylabel('Source Timestep')
+        
+        # Add colorbar
+        plt.colorbar(im, ax=axes[0])
+        
+        # Create a combined graph visualization
+        G = nx.DiGraph()
+        
+        # Add nodes for each timestep
+        for t, graph in enumerate(graph_data):
+            if 'x' in graph and 'node_ids' in graph:
+                for i, node_id in enumerate(graph['node_ids']):
+                    # Add node with timestep prefix to avoid collisions
+                    node_name = f"t{t}_n{node_id}"
+                    G.add_node(node_name, timestep=t, node_id=node_id)
+        
+        # Add temporal edges based on attention
+        for t1 in range(len(graph_data)):
+            for t2 in range(len(graph_data)):
+                # Only show significant attention (above average)
+                if avg_attention[t1, t2] > avg_attention.mean():
+                    # Connect timesteps with directed edge
+                    edge_weight = avg_attention[t1, t2]
+                    G.add_edge(f"t{t1}", f"t{t2}", weight=edge_weight)
+        
+        # Position nodes in a circular layout
+        pos = nx.spring_layout(G)
+        
+        # Draw the graph
+        nx.draw_networkx_nodes(G, pos, ax=axes[1], node_size=node_size,
+                               node_color=list(nx.get_node_attributes(G, 'timestep').values()),
+                               cmap=colormap)
+        
+        # Draw edges with width proportional to attention weight
+        edge_weights = [G[u][v]['weight'] * edge_width_scale for u, v in G.edges()]
+        nx.draw_networkx_edges(G, pos, ax=axes[1], width=edge_weights,
+                               edge_color='gray', alpha=0.7, arrows=True)
+        
+        # Add labels
+        nx.draw_networkx_labels(G, pos, ax=axes[1], font_size=10)
+        
+        axes[1].set_title('Temporal Graph Structure')
+        axes[1].axis('off')
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Save plot if requested
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        # Show plot if requested
+        if show_plot:
+            plt.show()
+        
+        return fig
+        
+    except Exception as e:
+        print(f"Error in temporal graph attention plotting: {str(e)}")
+        # Return a simple error figure
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.text(0.5, 0.5, f"Visualization Error: {str(e)}",
+                ha='center', va='center', fontsize=12)
+        ax.axis('off')
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            
+        return fig
 
 def plot_interactive_attention(
     geometric_attention: List[torch.Tensor],

@@ -1182,26 +1182,26 @@ class TemporalPropagation(nn.Module):
     def forward(
         self,
         node_features_seq: List[torch.Tensor],
-        node_masks_seq: Optional[List[torch.Tensor]] = None,
+        node_masks_seq: Optional[List[Union[torch.Tensor, List[int]]]] = None,
         time_stamps: Optional[torch.Tensor] = None,
-        memory_bank: Optional[Dict[int, torch.Tensor]] = None
-    ) -> Tuple[List[torch.Tensor], Optional[Dict[int, torch.Tensor]]]:
+        memory_bank: Optional[Union[Dict[int, torch.Tensor], Any]] = None
+    ) -> Tuple[List[torch.Tensor], Optional[Union[Dict[int, torch.Tensor], Any]]]:
         """
         Forward pass for the temporal propagation module.
         
         Args:
             node_features_seq: List of node features at each time step
                              [num_time_steps, batch_size, input_dim]
-            node_masks_seq: List of node masks at each time step (default: None)
-                           [num_time_steps, batch_size]
+            node_masks_seq: List of node masks at each time step or node IDs
+                          [num_time_steps, batch_size] or [num_time_steps, [node_ids]]
             time_stamps: Time stamps for each step [batch_size, num_time_steps] (default: None)
-            memory_bank: Dictionary of node memory states (default: None)
-                        {node_id: tensor[hidden_dim]}
+            memory_bank: Either a NodeMemoryBank instance or dictionary of node memory states
+                        NodeMemoryBank instance or {node_id: tensor[hidden_dim]}
             
         Returns:
             Tuple of (propagated_features, updated_memory_bank)
                 propagated_features: List of propagated node features for each time step
-                                  [num_time_steps, batch_size, hidden_dim]
+                                   [num_time_steps, batch_size, hidden_dim]
                 updated_memory_bank: Updated dictionary of node memory states
         """
         print(f"\n===== DEBUGGING: TemporalPropagation.forward =====")
@@ -1214,13 +1214,23 @@ class TemporalPropagation(nn.Module):
             node_features_seq = [node_features_seq]
             print(f"Converted to list with single tensor")
         
-        # First check if we're getting node_ids instead of masks, but don't convert yet
-        node_ids_instead_of_masks = False
+        # First check if we're getting node_ids instead of masks
+        node_ids_seq = None
         if isinstance(node_masks_seq, list) and node_masks_seq and not isinstance(node_masks_seq[0], torch.Tensor):
             print(f"WARNING: node_masks_seq appears to be a list of node_ids, not tensor masks")
             print(f"node_masks_seq first element type: {type(node_masks_seq[0])}")
-            node_ids_instead_of_masks = True
-        
+            # Store the original node IDs for memory bank usage
+            node_ids_seq = node_masks_seq.copy()
+            
+            # Create a new memory bank if none exists
+            if memory_bank is None:
+                # Create a memory bank with the right hidden dimension
+                from ..utils.memory_bank import NodeMemoryBank
+                memory_bank = NodeMemoryBank(
+                    hidden_dim=self.hidden_dim,
+                    device=device
+                )
+                print(f"Created new NodeMemoryBank instance")
         print(f"node_features_seq length: {len(node_features_seq)}")
         if len(node_features_seq) > 0:
             print(f"First element type: {type(node_features_seq[0])}")
@@ -1235,48 +1245,105 @@ class TemporalPropagation(nn.Module):
             
         print(f"memory_bank is {None if memory_bank is None else 'provided'}")
         
-        # Attempt to get dimensions and device
-        try:
-            num_time_steps = len(node_features_seq)
-            batch_size = node_features_seq[0].size(0)
-            device = node_features_seq[0].device
-            print(f"num_time_steps: {num_time_steps}, batch_size: {batch_size}, device: {device}")
-        except Exception as e:
-            print(f"Error getting dimensions: {str(e)}")
-            # Set defaults
-            num_time_steps = len(node_features_seq) if isinstance(node_features_seq, list) else 1
-            batch_size = 1
-            device = next(self.parameters()).device
-            print(f"Using fallback dimensions - num_time_steps: {num_time_steps}, batch_size: {batch_size}")
+        # Get dimensions and device
+        num_time_steps = len(node_features_seq)
+        batch_size = node_features_seq[0].size(0) if len(node_features_seq) > 0 else 0
+        device = node_features_seq[0].device if len(node_features_seq) > 0 else next(self.parameters()).device
+        print(f"num_time_steps: {num_time_steps}, batch_size: {batch_size}, device: {device}")
         
-        # NOW we can safely convert node_ids to masks since we have batch_size and device
-        if node_ids_instead_of_masks:
-            # Convert node_ids to proper tensor masks - crucial for correct attention
-            converted_masks = []
-            for t in range(len(node_features_seq)):
-                if t < len(node_masks_seq):
-                    node_ids = node_masks_seq[t]
-                    # Create proper attention mask - all nodes should attend to each other by default
-                    # This is crucial for the model's performance
-                    mask = torch.ones(batch_size, device=device)
-                    converted_masks.append(mask)
-                else:
-                    # Default for time steps without masks
-                    converted_masks.append(torch.ones(batch_size, device=device))
+        # Create proper attention masks based on node_ids_seq
+        if node_ids_seq is not None:
+            # Track all unique node IDs
+            all_node_ids = set()
+            for t in range(len(node_ids_seq)):
+                all_node_ids.update(node_ids_seq[t])
+                
+            # Create a mapping from node_id to consecutive index
+            # This ensures mask dimensions are manageable
+            node_id_to_idx = {node_id: idx for idx, node_id in enumerate(sorted(all_node_ids))}
+            num_unique_nodes = len(node_id_to_idx)
             
-            # Replace the node_ids with proper masks
-            node_masks_seq = converted_masks
+            # Create binary node existence masks
+            # Shape: [timestep, num_unique_nodes] where 1 indicates node exists at that timestep
+            node_existence_masks = torch.zeros(num_time_steps, num_unique_nodes, device=device)
+            
+            for t in range(num_time_steps):
+                if t < len(node_ids_seq):
+                    for node_id in node_ids_seq[t]:
+                        if node_id in node_id_to_idx:  # Ensure node_id is valid
+                            idx = node_id_to_idx[node_id]
+                            node_existence_masks[t, idx] = 1.0
+            
+            # Create masks that match attention dimensions
+            # Shape: [batch_size, num_heads, seq_len, seq_len]
+            batch_size = node_features_seq[0].size(0)
+            converted_masks = []
+            
+            for t in range(num_time_steps):
+                # Create a base mask where all nodes can attend to each other
+                mask = torch.ones(batch_size, 1, num_time_steps, num_time_steps, device=device)
+                
+                # If we restrict attention to same timestep only, apply temporal mask
+                if self.restrict_temporal_attention:
+                    # Only allow nodes to attend within the same timestep
+                    for b in range(mask.size(0)):
+                        mask[b, 0, :, :] = torch.eye(num_time_steps, device=device)
+                
+                converted_masks.append(mask)
+            
+            # Store node existence information for memory bank access and visualization
+            self.node_existence_masks = node_existence_masks
+            
+            # Store original node IDs and mapping for memory bank access
+            self.node_id_to_idx = node_id_to_idx
+            self.original_node_ids = node_ids_seq
+            
+            # Create proper masks matching attention scores dimensions
+            # Shape should be [batch_size, 1, seq_len, seq_len]
+            mask_shape = torch.Size([batch_size, 1, num_time_steps, num_time_steps])
+            temporal_mask = torch.ones(mask_shape, device=device)
+            print(f"Created masks with shape {temporal_mask.shape} to match attention dimensions")
+            
+            # Replace the original masks with the converted masks
+            node_masks_seq = temporal_mask
             print(f"Converted node_ids to proper tensor masks")
+            
+            # Store the temporal mask for use in temporal attention
+            self.temporal_mask = temporal_mask
+        else:
+            self.temporal_mask = None
         
-        # Initialize memory bank if not provided
-        if memory_bank is None and self.use_gating:
-            memory_bank = {}
+        # Handle memory bank initialization and usage
+        memory_bank_type = type(memory_bank).__name__
+        print(f"Memory bank type: {memory_bank_type}")
+        
+        if hasattr(memory_bank, 'get_state') and hasattr(memory_bank, 'update_state'):
+            # This is a NodeMemoryBank instance
+            print(f"Using NodeMemoryBank instance with {memory_bank.size} nodes")
+        else:
+            # Convert dictionary memory bank to NodeMemoryBank
+            from ..utils.memory_bank import NodeMemoryBank
+            new_memory_bank = NodeMemoryBank(
+                hidden_dim=self.hidden_dim,
+                device=device
+            )
+            
+            # Transfer dictionary contents if any
+            if isinstance(memory_bank, dict) and memory_bank:
+                for node_id, state in memory_bank.items():
+                    # Handle both tensor and list states
+                    if isinstance(state, list):
+                        state = torch.tensor(state, device=device)
+                    new_memory_bank.update([node_id], state.unsqueeze(0))
+                
+                print(f"Converted dictionary memory bank with {len(memory_bank)} items to NodeMemoryBank")
+            
+            memory_bank = new_memory_bank
+            print(f"Using new NodeMemoryBank instance")
         # Create default masks if not provided
         if node_masks_seq is None:
-            # Create binary masks with all ones (assume all nodes are active)
-            node_masks_seq = []
-            for t in range(num_time_steps):
-                node_masks_seq.append(torch.ones(batch_size, device=device))
+            # Create binary masks with all ones (assume all nodes are valid)
+            node_masks_seq = [torch.ones(batch_size, batch_size, device=device) for _ in range(num_time_steps)]
         
         # Apply temporal evolution
         evolved_features = self.evolution_layer(node_features_seq, time_stamps)
@@ -1285,45 +1352,137 @@ class TemporalPropagation(nn.Module):
         if self.use_skip_connection:
             evolved_features = self.skip_connection(evolved_features)
         
-        # Apply gating for memory management if used
-        if self.use_gating and memory_bank is not None:
+        # Apply memory state propagation and gating
+        # This is essential for maintaining node states across timesteps
+        if node_ids_seq is not None:
+            # For tracking node appearances across timesteps
+            node_last_seen = {}  # Maps node_id -> timestep it was last seen
+            
+            # Check if we're using NodeMemoryBank instead of a dictionary
+            using_node_memory_bank = hasattr(memory_bank, 'get_state') and hasattr(memory_bank, 'update_state')
+            
             # Process each time step
             for t in range(num_time_steps):
-                if isinstance(node_masks_seq[t], torch.Tensor):
-                    active_nodes = torch.nonzero(node_masks_seq[t]).squeeze(-1)
-                else:
-                    # Handle case when it's not a tensor
-                    active_nodes = range(batch_size)  # Default to all nodes
-                
-                # Process active nodes
-                for node_idx in active_nodes:
-                    # Handle both tensor and int cases
-                    if isinstance(node_idx, torch.Tensor):
-                        node_id = node_idx.item()
-                    else:
-                        node_id = node_idx  # Already an int
-                        
-                    # Make sure node_idx is within bounds of the feature tensor
-                    feat_size = evolved_features[t].size(0)
-                    if isinstance(node_idx, int) and node_idx >= feat_size:
-                        # Skip this node if index is out of bounds
-                        continue
+                if t < len(node_ids_seq):
+                    active_node_ids = node_ids_seq[t]
+                    print(f"Time step {t}, processing {len(active_node_ids)} active nodes")
                     
-                    try:
-                        current_feat = evolved_features[t][node_idx].unsqueeze(0)
+                    # First, apply memory bank for reappearing nodes
+                    for i, node_id in enumerate(active_node_ids):
+                        if i >= evolved_features[t].size(0):
+                            print(f"Skipping node_id {node_id} at time {t} - index {i} out of bounds (max {evolved_features[t].size(0)-1})")
+                            continue  # Skip if index is out of bounds
                         
-                        # Check if node exists in memory
-                        if node_id in memory_bank:
-                            # Node is reappearing, apply gating
-                            previous_feat = memory_bank[node_id].unsqueeze(0)
-                            gated_feat = self.gating_unit(current_feat, previous_feat)
-                            evolved_features[t][node_idx] = gated_feat.squeeze(0)
-                        
-                        # Update memory bank
-                        memory_bank[node_id] = evolved_features[t][node_idx].detach().clone()
-                    except IndexError:
-                        # Handle any unexpected index errors
-                        continue
+                        try:
+                            # Get current features for this node
+                            current_feat = evolved_features[t][i]
+                            
+                            # Get previous features from appropriate source
+                            has_previous_state = False
+                            previous_feat = None
+                            
+                            if using_node_memory_bank:
+                                previous_feat = memory_bank.get_state(node_id)
+                                has_previous_state = previous_feat is not None
+                            else:
+                                has_previous_state = node_id in memory_bank
+                                if has_previous_state:
+                                    previous_feat = memory_bank[node_id]  # Direct access from dictionary
+                            
+                            # Process nodes with previous state
+                            if has_previous_state and previous_feat is not None:
+                                # Log successful memory retrieval
+                                if t % 10 == 0 and i % 10 == 0:  # Reduce logging frequency
+                                    print(f"Retrieved previous state for node {node_id} at time {t}")
+                                
+                                # Ensure tensor shapes match
+                                if previous_feat.shape != current_feat.shape:
+                                    # Resize previous feature to match current feature
+                                    if previous_feat.dim() == 1 and current_feat.dim() == 1:
+                                        if len(previous_feat) < len(current_feat):
+                                            # Pad with zeros
+                                            padding = torch.zeros(len(current_feat) - len(previous_feat),
+                                                                device=previous_feat.device)
+                                            previous_feat = torch.cat([previous_feat, padding])
+                                        else:
+                                            # Truncate
+                                            previous_feat = previous_feat[:len(current_feat)]
+                                
+                                if node_id not in node_last_seen or node_last_seen[node_id] < t-1:
+                                    # Node is reappearing after absence - use stronger memory contribution
+                                    if self.use_gating:
+                                        try:
+                                            # Use gating mechanism with bias toward memory for returning nodes
+                                            # Calculate time gap since last appearance
+                                            time_gap = t - node_last_seen.get(node_id, 0)
+                                            
+                                            # Adjust memory bias based on time gap (more recent = higher bias)
+                                            # For longer gaps, we need to trust the memory less
+                                            memory_bias = max(0.5, 0.9 - (0.1 * min(time_gap, 4)))
+                                            
+                                            print(f"Node {node_id} reappearing after {time_gap} steps with memory bias {memory_bias:.2f}")
+                                            
+                                            gated_feat = self.gating_unit(
+                                                current_feat.unsqueeze(0),
+                                                previous_feat.unsqueeze(0),
+                                                memory_bias=memory_bias  # Dynamically adjusted memory bias
+                                            ).squeeze(0)
+                                            evolved_features[t][i] = gated_feat
+                                        except Exception as e:
+                                            print(f"Gating error: {e}, using fallback blending")
+                                            # Calculate adaptive memory weight based on time gap
+                                            time_gap = t - node_last_seen.get(node_id, 0)
+                                            memory_weight = max(0.4, 0.9 - (0.1 * min(time_gap, 5)))
+                                            current_weight = 1.0 - memory_weight
+                                            # Fallback to adaptive weighted average
+                                            evolved_features[t][i] = memory_weight * previous_feat + current_weight * current_feat
+                                    else:
+                                        # Enhanced weighted average for returning nodes with adaptive weighting
+                                        time_gap = t - node_last_seen.get(node_id, 0)
+                                        memory_weight = max(0.4, 0.9 - (0.1 * min(time_gap, 5)))  # Decay with time
+                                        current_weight = 1.0 - memory_weight
+                                        
+                                        merged_feat = current_weight * current_feat + memory_weight * previous_feat
+                                        evolved_features[t][i] = merged_feat
+                                else:
+                                    # Node is continuing from previous timestep
+                                    if self.use_gating:
+                                        # Use gating with higher memory weight for continuity
+                                        gated_feat = self.gating_unit(
+                                            current_feat.unsqueeze(0),
+                                            previous_feat.unsqueeze(0),
+                                            memory_bias=0.6  # Bias toward memory for continuity
+                                        ).squeeze(0)
+                                        evolved_features[t][i] = gated_feat
+                            
+                            # Update last seen time for this node
+                            node_last_seen[node_id] = t
+                            
+                            # Create a copy to avoid modifying the original tensor
+                            # This is critical for backward pass stability
+                            node_state = evolved_features[t][i].detach().clone()
+                            
+                            # Add a small amount of current timestep information to the memory
+                            # This helps with handling the temporal dynamics
+                            if t > 0:
+                                node_state = node_state + 0.01 * torch.tensor(t, device=node_state.device,
+                                                                             dtype=node_state.dtype)
+                            
+                            if using_node_memory_bank:
+                                # Update the NodeMemoryBank using its method
+                                memory_bank.update_state(node_id, node_state, t)
+                                if t % 10 == 0 and i % 10 == 0:  # Reduce logging frequency
+                                    print(f"Updated memory bank for node {node_id} at time {t}")
+                            else:
+                                # Update the dictionary with the proper state
+                                memory_bank[node_id] = node_state
+                        except Exception as e:
+                            print(f"Error processing node {node_id} at time {t}: {str(e)}")
+                            # Ensure we don't lose the node from memory even with an error
+                            if not node_id in memory_bank and not using_node_memory_bank:
+                                memory_bank[node_id] = torch.zeros(self.hidden_dim, device=device)
+            
+            print(f"Updated memory bank - now contains {len(memory_bank)} nodes")
         
         # Apply final transformations
         output_features = []
@@ -1346,7 +1505,6 @@ class TemporalPropagation(nn.Module):
         print(f"Memory bank size: {len(memory_bank) if memory_bank is not None else 'None'}")
         print(f"===== DEBUGGING: TemporalPropagation.forward complete =====\n")
         
-        return output_features, memory_bank
         return output_features, memory_bank
     
     def extra_repr(self) -> str:

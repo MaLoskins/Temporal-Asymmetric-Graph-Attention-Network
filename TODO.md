@@ -1,5 +1,4 @@
 # TODO:
 
 
-1. Run Sotas, campare
-2. Improvement use case (efficiency testing)
+1. Improve model performance, there are issues with the model that are making it perform poorly.

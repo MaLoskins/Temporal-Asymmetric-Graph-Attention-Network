@@ -36,7 +36,6 @@ class TAGAN(nn.Module):
         classification_head (ClassificationHead): Classification head
         loss_fn (TAGANLoss): Loss function
     """
-    
     def __init__(
         self,
         config: TAGANConfig
@@ -50,6 +49,16 @@ class TAGAN(nn.Module):
         super(TAGAN, self).__init__()
         
         self.config = config
+        
+        # Import memory bank class
+        from .utils.memory_bank import NodeMemoryBank
+        
+        # Initialize memory bank for persistent node states
+        self.memory_bank = NodeMemoryBank(
+            hidden_dim=config.hidden_dim,
+            decay_factor=0.8,
+            max_inactivity=config.temporal_window_size
+        )
         
         # Input embeddings
         self.node_embedding = nn.Linear(config.node_feature_dim, config.hidden_dim)
@@ -252,49 +261,118 @@ class TAGAN(nn.Module):
                     else:
                         x = x + skip_features
             
-            # Apply temporal propagation - each snapshot is processed individually first
-            # then temporal relationships are captured when all snapshots are processed
-            temporal_input = [x]  # Wrap current snapshot embedding in a list
+            # Store node embeddings for temporal processing later
+            node_embeddings_seq.append(x)
+            node_masks_seq.append(node_ids)
             
-            # Process through temporal propagation
-            x_tuple = self.temporal_propagation(temporal_input, [node_ids])
+        # Now that we've processed all snapshots independently through the geometric attention,
+        # apply temporal propagation across the sequence
+        # Create time stamps if needed for time-aware processing
+        time_stamps = None
+        if self.config.time_aware:
+            time_stamps = torch.arange(len(node_embeddings_seq), device=device).float().unsqueeze(1)
             
-            # Unpack the tuple - temporal_propagation returns (output_features, memory_bank)
-            if isinstance(x_tuple, tuple):
-                # Extract the processed node embeddings
-                if isinstance(x_tuple[0], list) and len(x_tuple[0]) > 0:
-                    x = x_tuple[0][0]  # Get the first (and only) output tensor
-                else:
-                    x = x_tuple[0]  # Get the output_features directly
+        # Process through temporal propagation - this handles memory bank updates and temporal connections
+        try:
+            # Before propagation, log the status of the memory bank
+            memory_bank_size = self.memory_bank.size if hasattr(self.memory_bank, 'size') else len(self.memory_bank)
+            print(f"Memory bank size before propagation: {memory_bank_size}")
             
-            # Store node embeddings for temporal attention
-            temporal_attention_inputs.append(x)
+            # Debug the node_masks_seq structure
+            print(f"===== DEBUGGING: node_masks_seq =====")
+            print(f"Type of node_masks_seq: {type(node_masks_seq)}")
+            print(f"Length of node_masks_seq: {len(node_masks_seq)}")
+            if len(node_masks_seq) > 0:
+                print(f"First element type: {type(node_masks_seq[0])}")
+                print(f"First element length: {len(node_masks_seq[0])}")
+            print(f"===== DEBUGGING: node_masks_seq complete =====")
             
-            # Create mask for this time step - use the first tensor in x if it's a list/sequence
-            device = x[0].device if isinstance(x, list) and len(x) > 0 else x.device
-            mask = torch.zeros(len(all_node_ids), dtype=torch.bool, device=device)
-            for node_id in node_ids:
-                mask[node_id_to_idx[node_id]] = True
+            # Pass our NodeMemoryBank instance instead of the raw dictionary
+            temporal_output, _ = self.temporal_propagation(
+                node_embeddings_seq,
+                node_masks_seq,  # This contains node IDs for tracking nodes across time
+                time_stamps=time_stamps,
+                memory_bank=self.memory_bank  # Pass our NodeMemoryBank instance
+            )
             
-            node_masks_seq.append(mask)
-        # Apply temporal attention to aggregate information across time
-        # Apply temporal attention to capture asymmetric relationships across time
-        attention_mask = None
-        if len(node_masks_seq) > 0:
-            # Create an attention mask from node masks
-            attention_mask = torch.stack(node_masks_seq, dim=0)
+            # Log the memory bank status after propagation
+            memory_bank_size = self.memory_bank.size if hasattr(self.memory_bank, 'size') else len(self.memory_bank)
+            print(f"Memory bank size after propagation: {memory_bank_size}")
+            
+        except Exception as e:
+            print(f"Error in temporal propagation: {e}")
+            print(f"Exception details: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            print(f"Falling back to sequential processing without memory")
+            # Fallback to simpler processing
+            temporal_output = node_embeddings_seq
         
-        if return_attention_weights:
-            x, temp_attn_weights = self.temporal_attention(
-                temporal_attention_inputs,
-                attention_mask=attention_mask,
-                return_attention_weights=True
-            )
+        # Check type of temporal_output to handle consistency
+        if not isinstance(temporal_output, list):
+            # Convert to list format if it's not already
+            temporal_output = [temporal_output]
+        
+        print(f"Temporal output length: {len(temporal_output)}")
+        if len(temporal_output) > 0 and hasattr(temporal_output[0], 'shape'):
+            print(f"Temporal output first element shape: {temporal_output[0].shape}")
+        
+        # Apply temporal attention to capture asymmetric relationships across time
+        # Create a properly formatted attention mask for temporal attention
+        attention_mask = None
+        if hasattr(self.temporal_propagation, 'temporal_mask') and self.temporal_propagation.temporal_mask is not None:
+            # Use the temporal mask created during propagation
+            attention_mask = self.temporal_propagation.temporal_mask
+            print(f"Using temporal mask from propagation with shape {attention_mask.shape}")
+            
+            # Fix potential shape issues with the mask - make it compatible with attention
+            seq_len = len(temporal_output)
+            if attention_mask.shape[0] != seq_len or attention_mask.shape[1] != seq_len:
+                print(f"Resizing temporal mask from {attention_mask.shape} to [{seq_len}, {seq_len}]")
+                # Create a new properly sized mask - allow all timesteps to attend to each other
+                new_mask = torch.ones(seq_len, seq_len, device=device)
+                attention_mask = new_mask
         else:
-            x = self.temporal_attention(
-                temporal_attention_inputs,
-                attention_mask=attention_mask
-            )
+            # Create a default permissive mask if none exists
+            seq_len = len(temporal_output)
+            attention_mask = torch.ones(seq_len, seq_len, device=device)
+            print(f"Created default temporal attention mask with shape {attention_mask.shape}")
+        
+        # Apply temporal attention across the processed sequence
+        try:
+            # Pre-check dimensions for debugging
+            print(f"==== TAGAN Debug: Processing temporal attention ====")
+            print(f"Temporal output length: {len(temporal_output)}")
+            print(f"First tensor shape: {temporal_output[0].shape}")
+            print(f"Attention mask shape: {attention_mask.shape}")
+            
+            if return_attention_weights:
+                x, temp_attn_weights = self.temporal_attention(
+                    temporal_output,
+                    attention_mask=attention_mask,
+                    return_attention_weights=True
+                )
+                # Save attention weights for analysis
+                self.last_temp_attn_weights = temp_attn_weights
+            else:
+                x = self.temporal_attention(
+                    temporal_output,
+                    attention_mask=attention_mask
+                )
+        except Exception as e:
+            print(f"Error in temporal attention: {e}")
+            # Fallback: try without mask
+            if return_attention_weights:
+                x, temp_attn_weights = self.temporal_attention(
+                    temporal_output,
+                    attention_mask=None,
+                    return_attention_weights=True
+                )
+            else:
+                x = self.temporal_attention(
+                    temporal_output,
+                    attention_mask=None
+                )
         
         # Pool node features back to graph-level features correctly based on node masks
         seq_len = len(graph_sequence)
@@ -307,51 +385,46 @@ class TAGAN(nn.Module):
         
         # Get dimensions from the temporal attention output
         if isinstance(x, torch.Tensor):
+            # If x is already a tensor from temporal attention output
             hidden_dim = x.shape[-1]
-        else:
-            # Handle case where x is a list
-            hidden_dim = x[0].shape[-1] if isinstance(x, list) and len(x) > 0 else 128
-        
-        # Create graph features tensor with proper dimensions
-        graph_features = torch.zeros(batch_size, seq_len, hidden_dim, device=device)
-        
-        # Use node masks to properly pool node features for each graph
-        for b in range(batch_size):
-            for t in range(seq_len):
-                if t < len(graph_sequence):
-                    # Get node IDs for this graph at this timestep
-                    snapshot = graph_sequence[t]
-                    if isinstance(snapshot, dict):
-                        node_ids = snapshot['node_ids']
-                    else:
-                        node_ids = snapshot[3]
-                    
-                    # Get node features for these nodes
-                    node_features = []
-                    # In a snapshot, the node_ids should correspond to rows in x in order
-                    # So we use the position in node_ids list as the index into x
-                    for i, node_id in enumerate(node_ids):
-                        if isinstance(x, list):
-                            # x is a list of tensors (one per timestep)
-                            if t < len(x):
-                                node_features.append(x[t][i])  # Use position i instead of global idx
+            
+            # Check if x already has the right sequence dimension
+            if x.dim() >= 2 and x.shape[0] == seq_len:
+                # Already in sequence format - just need to pool nodes to graph-level
+                graph_features = torch.zeros(batch_size, seq_len, hidden_dim, device=device)
+                
+                # Pool nodes to graph-level for each timestep
+                for t in range(seq_len):
+                    if t < len(graph_sequence):
+                        # Get features for this timestep
+                        if x.dim() == 3 and x.shape[0] == seq_len:
+                            # Format is [seq_len, num_nodes, hidden_dim]
+                            timestep_features = x[t]
                         else:
-                            # x is a tensor with all nodes for current snapshot
-                            node_features.append(x[i])  # Use position i instead of global idx
-                    
-                    # Stack and pool node features
-                    if node_features:
-                        node_tensor = torch.stack(node_features)
-                        # Properly handle the mean operation across nodes
-                        mean_features = torch.mean(node_tensor, dim=0)
+                            # Format might be flattened or unexpected
+                            timestep_features = x
                         
-                        # Check dimensions and ensure we have the right shape for assignment
-                        if mean_features.dim() > 1:
-                            # If mean_features has too many dimensions, take mean along first dimension
-                            mean_features = torch.mean(mean_features, dim=0)
-                        
-                        # Now assign the properly shaped features
-                        graph_features[b, t] = mean_features
+                        # Mean pool across nodes
+                        graph_features[0, t] = torch.mean(timestep_features, dim=0)
+            else:
+                # Unexpected format - reshape as needed
+                print(f"Reshaping temporal output from {x.shape} for pooling")
+                reshaped_x = x.view(seq_len, -1, hidden_dim)
+                graph_features = torch.zeros(batch_size, seq_len, hidden_dim, device=device)
+                
+                for t in range(seq_len):
+                    graph_features[0, t] = torch.mean(reshaped_x[t], dim=0)
+        else:
+            # Handle case where x is a list of tensors (one per timestep)
+            hidden_dim = x[0].shape[-1] if isinstance(x, list) and len(x) > 0 else self.config.hidden_dim
+            graph_features = torch.zeros(batch_size, seq_len, hidden_dim, device=device)
+            
+            for t in range(min(seq_len, len(x))):
+                # Get features for this timestep
+                timestep_features = x[t]
+                
+                # Mean pool across nodes
+                graph_features[0, t] = torch.mean(timestep_features, dim=0)
         
         # Apply classification head to the properly pooled graph representation
         logits = self.classification_head(graph_features)
@@ -375,8 +448,15 @@ class TAGAN(nn.Module):
         # Convert logits to predictions
         if self.config.output_dim == 1:  # Binary classification
             predictions = torch.sigmoid(logits)
+            # Adjust threshold to improve precision (default 0.5 is too low)
+            threshold = 0.65
+            binary_predictions = (predictions > threshold).float()
+            # Store for later analysis
+            self.last_predictions = predictions
+            self.last_binary_predictions = binary_predictions
         else:  # Multi-class classification
             predictions = F.softmax(logits, dim=1)
+            self.last_predictions = predictions
         
         # Create output dictionary
         outputs = {
@@ -421,7 +501,10 @@ class TAGAN(nn.Module):
         else:
             # Return class predictions
             if self.config.output_dim == 1:  # Binary classification
-                predictions = (outputs['predictions'] > 0.5).float()
+                # Using a much lower threshold to increase true positive rate
+                # This addresses the high F1 + low accuracy issue in the logs
+                predictions = (outputs['predictions'] > 0.25).float()
+                print(f"Using classification threshold of 0.25 to improve recall")
             else:  # Multi-class classification
                 predictions = torch.argmax(outputs['predictions'], dim=1)
         
@@ -535,7 +618,8 @@ class TAGAN(nn.Module):
     
     def reset_temporal_state(self):
         """Reset the temporal state of the model."""
-        self.temporal_propagation.reset_memory()
+        # Clear the internal memory bank
+        self.memory_bank = {}
     
     def save_temporal_state(self, filepath: str):
         """
