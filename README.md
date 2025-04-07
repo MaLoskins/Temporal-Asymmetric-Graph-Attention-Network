@@ -1,4 +1,4 @@
-# Temporal Asymmetric Geometric Attention Network (TAGAN)
+# Temporal Asymmetric Graph Attention Network (TAGAN)
 
 ## Overview
 
